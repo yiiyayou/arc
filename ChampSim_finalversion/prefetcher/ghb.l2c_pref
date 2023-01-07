@@ -1,0 +1,59 @@
+#include "cache.h"
+#include "ghb.h"
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L2C GHB stride prefetcher" << endl;
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    if (IT_T[ip % IT_T_SIZE].GHB_E_ptr == NULL)
+    {
+        GHB_T[now_index].prev_ptr = NULL;
+    }
+    else
+    {   
+        GHB_T[now_index].prev_ptr = IT_T[ip % IT_T_SIZE].GHB_E_ptr;
+    }
+    IT_T[ip % IT_T_SIZE].GHB_E_ptr = &GHB_T[now_index];
+
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE;
+    GHB_T[now_index].cl_addr = cl_addr;
+
+    //查找最近3次访问GHB项
+    GHB_E  recent1=GHB_T[now_index];
+    GHB_E * recent2_ptr=recent1.prev_ptr;
+    GHB_E * recent3_ptr=NULL;
+    if(recent2_ptr!=NULL)    recent3_ptr=recent2_ptr->prev_ptr;
+    
+    //则计算步长是否相同，如果相同，则预取
+    if( (recent2_ptr!=NULL) && (recent3_ptr!=NULL) ){
+        uint64_t stride1 = recent1.cl_addr - recent2_ptr->cl_addr;
+        uint64_t stride2 = recent2_ptr->cl_addr - recent3_ptr->cl_addr;
+        if(stride1==stride2){
+            for (int i = 0; i <=  degree; i++){
+                uint64_t pf_addr = (cl_addr + (look_head+ i) * stride1) << LOG2_BLOCK_SIZE;
+                if ((pf_addr >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE))
+                    break;
+                prefetch_line(ip, addr, pf_addr, FILL_L2, 0);
+            }
+        }
+    }
+    
+
+    //更新now_index
+    now_index = (now_index + 1) % GHB_T_SIZE;
+    
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C GHB stride prefetcher final stats" << endl;
+}

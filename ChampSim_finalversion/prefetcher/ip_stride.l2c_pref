@@ -1,0 +1,149 @@
+//
+// From Data Prefetching Championship Simulator 2
+// Seth Pugsley, seth.h.pugsley@intel.com
+//
+
+/*
+
+  This file describes an Instruction Pointer-based (Program Counter-based) stride prefetcher.  
+  The prefetcher detects stride patterns coming from the same IP, and then 
+  prefetches additional cache lines.
+
+  Prefetches are issued into the L2 or LLC depending on L2 MSHR occupancy.
+
+ */
+
+#include "cache.h"
+
+#define IP_TRACKER_COUNT 1024
+#define PREFETCH_DEGREE 3
+
+class IP_TRACKER {  //对应一个块
+  public:
+    // the IP we're tracking    //块的ip
+    uint64_t ip;
+
+    // the last address accessed by this IP //刚刚访问的块
+    uint64_t last_cl_addr;
+
+    // the stride between the last two addresses accessed by this IP    //刚刚访问的两个块之间的距离
+    int64_t last_stride;
+
+    // use LRU to evict old IP trackers //这个块的排名
+    uint32_t lru;
+
+    IP_TRACKER () {
+        ip = 0;
+        last_cl_addr = 0;
+        last_stride = 0;
+        lru = 0;
+    };
+};
+
+IP_TRACKER trackers[IP_TRACKER_COUNT];//1024个追踪器
+
+void CACHE::l2c_prefetcher_initialize() 
+{
+    cout << "CPU " << cpu << " L2C IP-based stride prefetcher" << endl;
+    for (int i=0; i<IP_TRACKER_COUNT; i++)
+        trackers[i].lru = i;    //初始化lru变量为0~1023，理解为一个排名，0是最近使用最多的追踪器；1023是最近使用最少的追踪器，应该被替换
+}
+
+uint32_t CACHE::l2c_prefetcher_operate(uint64_t addr, uint64_t ip, uint8_t cache_hit, uint8_t type, uint32_t metadata_in)
+{
+    // check for a tracker hit  检查参数ip是MISS还是HIT
+    uint64_t cl_addr = addr >> LOG2_BLOCK_SIZE; //参数地址除以块大小64KB，第几个块，按块加载
+
+    int index = -1;
+    for (index=0; index<IP_TRACKER_COUNT; index++) {
+        if (trackers[index].ip == ip)   //遍历追踪器们，找到ip为参数ip的这个追踪器，记下索引index
+            break;
+    }
+
+    // this is a new IP that doesn't have a tracker yet, so allocate one
+    if (index == IP_TRACKER_COUNT) {    //非break退出，意味着遍历完了追踪器们，也没有找到ip为参数ip的追踪器，意味着这个ip是一个新的ip，MISS，进行替换
+
+        for (index=0; index<IP_TRACKER_COUNT; index++) {
+            if (trackers[index].lru == (IP_TRACKER_COUNT-1))    //找到lru是排名最后（1023）的追踪器记录index，应该被替换掉
+                break;
+        }
+
+        trackers[index].ip = ip;                        //1.对这个最近使用最少的index号追踪器进行替换设置，设置为参数ip
+        trackers[index].last_cl_addr = cl_addr;         //2.对这个最近使用最少的index号追踪器进行替换设置，最后访问块序设置为cl_addr=addr/64KB
+        trackers[index].last_stride = 0;                //3.对这个最近使用最少的index号追踪器进行替换设置，步长设置为0
+
+        //cout << "[IP_STRIDE] MISS index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << endl;
+
+        for (int i=0; i<IP_TRACKER_COUNT; i++) {
+            if (trackers[i].lru < trackers[index].lru)  //0~1022的排名都靠后1名，变成1~1023
+                trackers[i].lru++;
+        }
+        trackers[index].lru = 0;                        //4.把刚刚替换的这个追踪器排名设为0，就是原先最后1023名逆袭第0名，表示最近刚刚访问的
+
+        return metadata_in;                             //MISS情况，进行替换，重新设置完被替换的追踪器属性后即可返回！
+    }
+
+    //在这一步，说明参数ip是HIT，index为参数ip所在的哪个追踪器
+    // sanity check
+    // at this point we should know a matching tracker index
+    if (index == -1)
+        assert(0);
+
+    // calculate the stride between the current address and the last address
+    // this bit appears overly complicated because we're calculating differences between unsigned address variables
+    int64_t stride = 0;
+    if (cl_addr > trackers[index].last_cl_addr)
+        stride = cl_addr - trackers[index].last_cl_addr;
+    else {
+        stride = trackers[index].last_cl_addr - cl_addr;
+        stride *= -1;
+    }   //不就是stride=cl_addr - trackers[index].last_cl_addr么...  参数地址算出的访问待块序-上一次访问块序
+
+    //cout << "[IP_STRIDE] HIT  index: " << index << " lru: " << trackers[index].lru << " ip: " << hex << ip << " cl_addr: " << cl_addr << dec << " stride: " << stride << endl;
+
+    // don't do anything if we somehow saw the same address twice in a row
+    if (stride == 0)    //如果两次访问的地址在同一个块内，直接返回
+        return metadata_in;
+    
+    //到这说明stride不为0！如果和上次的stride相等，则做预取，否则啥也不干
+    // only do any prefetching if there's a pattern of seeing the same stride more than once
+    if (stride == trackers[index].last_stride) {
+
+        // do some prefetching
+        for (int i=0; i<PREFETCH_DEGREE; i++) {        //PREFETCH_DEGREE=3；循环3次
+            uint64_t pf_address = (cl_addr + (stride*(i+1))) << LOG2_BLOCK_SIZE;        //next_line的做法pf_address=(块序+1)*64KB;这里pf_address=(块序+stride*1/2/3)*64KB
+
+            // only issue a prefetch if the prefetch address is in the same 4 KB page as the current demand access address
+            //预取最多三次，如果预取的地址超出了本次访问的地址所在页内，则立马停止预取
+            if ((pf_address >> LOG2_PAGE_SIZE) != (addr >> LOG2_PAGE_SIZE)) //地址除以2的12次方即4KB看在哪个页
+                break;
+
+            // check the MSHR occupancy to decide if we're going to prefetch to the L2 or LLC
+            if (MSHR.occupancy < (MSHR.SIZE>>1))    //占用情况比总容量的一半还小，则在L2级预取；否在在LLC级预取
+	      prefetch_line(ip, addr, pf_address, FILL_L2, 0);
+            else
+	      prefetch_line(ip, addr, pf_address, FILL_LLC, 0);
+        }
+    }
+
+    trackers[index].last_cl_addr = cl_addr;         //2.更新最后的访问块序
+    trackers[index].last_stride = stride;           //3.更新最后的步长
+
+    for (int i=0; i<IP_TRACKER_COUNT; i++) {
+        if (trackers[i].lru < trackers[index].lru)
+            trackers[i].lru++;
+    }
+    trackers[index].lru = 0;                        //4.逆袭lru为0
+
+    return metadata_in;
+}
+
+uint32_t CACHE::l2c_prefetcher_cache_fill(uint64_t addr, uint32_t set, uint32_t way, uint8_t prefetch, uint64_t evicted_addr, uint32_t metadata_in)
+{
+  return metadata_in;
+}
+
+void CACHE::l2c_prefetcher_final_stats()
+{
+    cout << "CPU " << cpu << " L2C PC-based stride prefetcher final stats" << endl;
+}
